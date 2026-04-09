@@ -15,14 +15,17 @@ class DataSource:
         self.cols = ['Index', 'Ticker', 'Price', '14d RSI', '2m Velocity %', '1h Change %', 'Today %', 'Last Sync']
 
     def calculate_rsi(self, series, period=14):
-        """Calculates RSI using Wilder's Exponential Smoothing (RMA)"""
+        """
+        Calculates RSI using Wilder's Smoothing (RMA).
+        Pandas ewm with com=(period - 1) is the exact math for Wilder's.
+        """
         delta = series.diff()
         gain = delta.clip(lower=0)
         loss = -1 * delta.clip(upper=0)
         
-        # Wilder's Smoothing (alpha = 1/N)
-        avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+        # Standard Wilder's Moving Average (RMA)
+        avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+        avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
         
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
@@ -38,11 +41,11 @@ class DataSource:
                         all_tickers.append(t)
                         ticker_to_index[t] = idx_name
 
-            # 1m data for velocity; 90d data for RSI stability
+            # 1m data for short-term; 90d for high-stability RSI
             data_1m = yf.download(all_tickers, period="2d", interval="1m", group_by='ticker', progress=False)
             data_1d = yf.download(all_tickers, period="90d", interval="1d", group_by='ticker', progress=False)
             
-            if data_1m.empty:
+            if data_1m.empty or data_1d.empty:
                 return pd.DataFrame(columns=_self.cols)
 
             combined_results = []
@@ -52,43 +55,38 @@ class DataSource:
                         continue
                         
                     df_1m = data_1m[ticker].dropna()
-                    df_1d = data_1d[ticker].dropna() if ticker in data_1d.columns.get_level_values(0) else pd.DataFrame()
+                    df_1d = data_1d[ticker].dropna()
                     
-                    if len(df_1m) < 61:
+                    if len(df_1m) < 61 or len(df_1d) < 30:
                         continue
                     
                     curr_p = df_1m['Close'].iloc[-1]
                     
-                    # 2m Velocity
+                    # Short-term metrics
                     prev_2m_p = df_1m['Close'].iloc[-3]
                     velocity_2m = ((curr_p - prev_2m_p) / prev_2m_p) * 100
                     
-                    # 1h Change
                     prev_1h_p = df_1m['Close'].iloc[-61]
                     change_1h = ((curr_p - prev_1h_p) / prev_1h_p) * 100
 
-                    # --- Corrected 14-Day RSI Logic ---
-                    current_rsi = np.nan
-                    if not df_1d.empty and len(df_1d) >= 14:
-                        # Ensure we don't have a "half-finished" today in df_1d 
-                        # so we can cleanly append our live curr_p
-                        history = df_1d['Close'].copy()
-                        today_date = datetime.now().date()
-                        
-                        if history.index[-1].date() >= today_date:
-                            history = history.iloc[:-1]
-                        
-                        # Append the live 1m price as the current daily bar
-                        combined_close = pd.concat([history, pd.Series([curr_p])])
-                        
-                        rsi_series = _self.calculate_rsi(combined_close, period=14)
-                        current_rsi = rsi_series.iloc[-1]
+                    # --- ULTRA-STABLE RSI LOGIC ---
+                    # We use ONLY the historical daily closes to keep the RSI anchored.
+                    # We add the live price as the 'current' day's close.
+                    history = df_1d['Close'].copy()
+                    
+                    # Strip out today's partial daily candle if yfinance included it
+                    today_date = datetime.now().date()
+                    history = history[history.index.date < today_date]
+                    
+                    # Combine history with exactly ONE live data point
+                    combined_close = pd.concat([history, pd.Series([curr_p])])
+                    
+                    rsi_series = _self.calculate_rsi(combined_close, period=14)
+                    current_rsi = rsi_series.iloc[-1]
 
-                    # Today Change (Relative to Daily Open)
-                    today_pct = 0.0
-                    if not df_1d.empty:
-                        today_open = df_1d['Open'].iloc[-1]
-                        today_pct = ((curr_p - today_open) / today_open) * 100
+                    # Today % Change
+                    today_open = df_1d['Open'].iloc[-1]
+                    today_pct = ((curr_p - today_open) / today_open) * 100
                     
                     combined_results.append({
                         'Index': ticker_to_index[ticker],
@@ -106,21 +104,4 @@ class DataSource:
             return pd.DataFrame(combined_results) if combined_results else pd.DataFrame(columns=_self.cols)
             
         except Exception as e:
-            st.error(f"Data Fetching Error: {str(e)}")
-            return pd.DataFrame(columns=_self.cols)
-
-def main():
-    st.set_page_config(page_title="Market Monitor", layout="wide")
-    st.title("Live Market Velocity & Wilder RSI")
-    
-    ds = DataSource()
-    df = ds.get_velocity_data()
-    
-    if not df.empty:
-        # Style the dataframe for better readability
-        st.dataframe(df.sort_values('2m Velocity %', ascending=False), use_container_width=True, hide_index=True)
-    else:
-        st.info("Awaiting market data...")
-
-if __name__ == "__main__":
-    main()
+            st.error(f"Data Fetching Error: {str(e
